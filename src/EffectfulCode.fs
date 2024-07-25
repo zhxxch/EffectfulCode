@@ -12,6 +12,13 @@ type EffectfulCodeState =
     | Raising of obj * Type
     | Resuming of Type * (obj * Type)
 
+type EffectfulCodeType<'codeT, 'raiseT, 'handleT> =
+    'codeT * 'raiseT * 'handleT
+
+type Effect<'raiseT, 'resumeT> =
+    | RaisingT of 'raiseT
+    | ResumingT of 'resumeT
+
 let unbox_resumed<'T> effectful_code_state =
     match effectful_code_state with
     | Resuming (e_typ, (r_obj, r_typ)) ->
@@ -35,44 +42,71 @@ type EffectfulResumptionFunc =
 type EffectfulResumptionDynamicInfo =
     ResumptionDynamicInfo<EffectfulCodeState>
 /// 'T: resumable code fragment result type
-type EffectfulCode<'T> =
-    ResumableCode<EffectfulCodeState, 'T>
+type EffectfulCode<'codeT, 'raiseT, 'handleT> =
+    ResumableCode<EffectfulCodeState,
+        EffectfulCodeType<'codeT, 'raiseT, 'handleT>>
 
+let inline CombineDynamic(
+        sm: byref<EffectfulCodeSM>,
+        code1: EffectfulCode<
+            'code1T, 'raise1T, 'handle1T>,
+        code2: EffectfulCode<
+            'code2T, 'raise2T, 'handle2T>) =
+    if code1.Invoke(&sm) then code2.Invoke(&sm)
+    else
+        let rec resume (mf: EffectfulResumptionFunc) =
+            EffectfulResumptionFunc(fun sm ->
+                if mf.Invoke(&sm)
+                then code2.Invoke(&sm)
+                else
+                    sm.ResumptionDynamicInfo.ResumptionFunc <-
+                        (resume (sm.ResumptionDynamicInfo.ResumptionFunc))
+                    false)
+        sm.ResumptionDynamicInfo.ResumptionFunc <-
+            (resume (sm.ResumptionDynamicInfo.ResumptionFunc))
+        false
+let inline BindDynamic (
+    sm: byref<EffectfulCodeSM>,
+    code: EffectfulCode<
+        'codeT, 'codeRaiseT, 'codeHandleT>,
+    cont: 'codeT -> EffectfulCode<'contT, 'contRaiseT, 'contHandleT>) =
+    CombineDynamic(&sm, code,
+        EffectfulCode<'contT, 'contRaiseT, 'contHandleT>(fun sm' ->
+            let resumed =
+                unbox_resumed<'codeT> sm'.Data
+            match resumed with
+            | Some r -> 
+                sm'.Data <- NoEffect
+                (cont r).Invoke(&sm')
+            | _ -> false
+        ))
 type EffectfulCodeBuilder() =
-    member inline __.Zero () = ResumableCode.Zero ()
-    member inline __.Delay (generator: unit -> EffectfulCode<'T>) =
+    member inline __.Delay (generator:
+        unit -> EffectfulCode<'codeT, 'raiseT, 'handleT>) =
         ResumableCode.Delay generator
     member inline __.Combine (
-        code1: EffectfulCode<unit>,
-        code2: EffectfulCode<'T>) =
-        ResumableCode.Combine (code1, code2)
+        code1: EffectfulCode<'code1T, 'raise1T, 'handle1T>,
+        code2: EffectfulCode<'code2T, 'raise2T, 'handle2T>) =
+        EffectfulCode<'code2T, 'raise1T * 'raise2T, 'handle1T * 'handle2T>(fun sm ->
+            CombineDynamic(&sm, code1, code2))
     member inline __.Return (x: 'T) =
-        EffectfulCode<'T> (fun sm ->
+        EffectfulCode<'T, unit, unit> (fun sm ->
             sm.Data <- Resuming (typeof<unit>, (box x, typeof<'T>)); true)
-    member inline __.Yield (x: 'e) =
-        EffectfulCode<'T> (fun sm ->
-            sm.Data <- Raising ((box x), typeof<'e>)
+    member inline self.Zero () = self.Return (())
+    member inline __.Yield (x: 'raiseT) =
+        EffectfulCode<'T, Effect<'raiseT,'T>, unit> (fun sm ->
+            sm.Data <- Raising ((box x), typeof<'raiseT>)
             ResumableCode.Yield().Invoke(&sm))
-    member self.BindDynamic (
-        sm: byref<EffectfulCodeSM>,
-        eff: EffectfulCode<'Th>,
-        cont: 'Th -> EffectfulCode<'Tc>) =
-        ResumableCode.CombineDynamic(
-            &sm,
-            EffectfulCode<_>(fun sm -> eff.Invoke(&sm)),
-            EffectfulCode<'Tc>(fun sm' ->
-                let resumed = unbox_resumed<'Th> sm'.Data in
-                match resumed with
-                | Some r -> 
-                    sm'.Data <- NoEffect
-                    (cont r).Invoke(&sm')
-                | _ -> false
-            ))
-    member inline self.Bind (eff: EffectfulCode<'Th>, cont: 'Th -> EffectfulCode<'Tc>) = 
-        EffectfulCode<'Tc>(fun sm ->
-            self.BindDynamic(&sm, eff, cont))
+    member inline self.Bind (
+        code: EffectfulCode<'codeT, 'codeRaiseT, 'codeHandleT>,
+        cont: 'codeT -> EffectfulCode<'contT, 'contRaiseT, 'contHandleT>) = 
+        EffectfulCode<'contT, 'codeRaiseT * 'contRaiseT, 'codeHandleT * 'contHandleT>(fun sm ->
+            BindDynamic(&sm, code, cont))
 
-let rec handle_with_dynamic<'e, 'Th, 'Tc> (sm: byref<EffectfulCodeSM>) (handler: 'e -> EffectfulCode<'Th>) (code: EffectfulCode<'Tc>) =
+let rec handle_with_dynamic
+    (sm: byref<EffectfulCodeSM>)
+    (handler: 'e -> EffectfulCode<'resumeT, 'handlerRaiseT, 'handlerHandleT>)
+    (code: EffectfulCode<'codeT, 'codeRaiseT, 'codeHandleT>) =
     let __stack_code_fin = code.Invoke(&sm)
     if __stack_code_fin then true
     else
@@ -82,21 +116,29 @@ let rec handle_with_dynamic<'e, 'Th, 'Tc> (sm: byref<EffectfulCodeSM>) (handler:
             match raised with
             | Some e -> 
                 EffectfulResumptionFunc(fun sm ->
-                    ResumableCode.CombineDynamic(
+                    CombineDynamic(
                         &sm,
-                        EffectfulCode<_>(fun sm -> (handler e).Invoke(&sm)),
-                        EffectfulCode<'Tc>(fun sm ->
-                            (handle_with_dynamic &sm handler (EffectfulCode<'Tc>(fun sm -> rf.Invoke(&sm)))))))
+                        (handler e),
+                        EffectfulCode<'codeT, 'codeRaiseT, 'codeHandleT>(fun sm ->
+                            (handle_with_dynamic &sm handler (EffectfulCode<'codeT, 'codeRaiseT, 'codeHandleT>(fun sm -> rf.Invoke(&sm)))))))
             | _ -> EffectfulResumptionFunc(fun sm ->
-                    (handle_with_dynamic &sm handler (EffectfulCode<'Tc>(fun sm -> rf.Invoke(&sm)))))
+                    (handle_with_dynamic &sm handler (EffectfulCode<'codeT, 'codeRaiseT, 'codeHandleT>(fun sm -> rf.Invoke(&sm)))))
         false
 
-let inline handle_with<'e, 'Th, 'Tc> (handler: 'e -> EffectfulCode<'Th>) (code: EffectfulCode<'Tc>) =
-    EffectfulCode<'Tc>(fun sm -> handle_with_dynamic &sm handler code)
+let inline handle_with
+    (handler: 'e -> EffectfulCode<'resumeT, 'handlerRaiseT, 'handlerHandleT>)
+    (code: EffectfulCode<'codeT, 'codeRaiseT, 'codeHandleT>) =
+    EffectfulCode<'codeT, 'codeRaiseT * 'handlerRaiseT, (Effect<'e, 'resumeT> -> 'codeHandleT) * 'handlerHandleT>(fun sm -> handle_with_dynamic &sm handler code)
 
 let inline async_sm_next(x: byref<'T> when 'T :> IAsyncStateMachine) = x.MoveNext()
 
-let inline run_effectful_code<'T> (code: EffectfulCode<'T>) =
+type TypeStackSymbol =
+    | Instance of Type
+    | Grouping
+
+let rec type_check_iter (raising: Type) (resuming: Type) (raising_stack: TypeStackSymbol list) (resuming_stack: TypeStackSymbol list) = ()
+
+let inline compile (code: EffectfulCode<'codeT, 'raiseT, 'handleT>) =
     let initialResumptionFunc = EffectfulResumptionFunc(fun sm -> code.Invoke(&sm))
     let resumptionInfo = {
         new EffectfulResumptionDynamicInfo(initialResumptionFunc) with 
@@ -105,18 +147,21 @@ let inline run_effectful_code<'T> (code: EffectfulCode<'T>) =
                     sm.ResumptionPoint <- -1
             member info.SetStateMachine(sm, state) = ()
     }
-    let mutable effectful_code_sm = new EffectfulCodeSM()
-    effectful_code_sm.ResumptionDynamicInfo <- resumptionInfo
-    effectful_code_sm.Data <- NoEffect
-    while effectful_code_sm.ResumptionPoint <> -1 do 
-        async_sm_next &effectful_code_sm
-    match effectful_code_sm.Data with
-        | Resuming (e_typ, (r_obj, r_typ)) -> unbox<'T> r_obj
-        | _ -> failwith "unhandled"
+    let mutable sm = new EffectfulCodeSM()
+    sm.ResumptionDynamicInfo <- resumptionInfo
+    sm.Data <- NoEffect
+    fun () ->
+        while sm.ResumptionPoint <> -1 do
+            async_sm_next &sm
+        match sm.Data with
+            | Resuming (e_typ, (r_obj, r_typ)) ->
+                unbox<'codeT> r_obj
+            | _ -> failwith "unhandled"
+
+let ef = new EffectfulCodeBuilder();;
 
 module Operators =
-    let ef = new EffectfulCodeBuilder()
-    let inline (/) (m: EffectfulCode<'Tc>) (h: 'e -> EffectfulCode<'Th>) =
+    let inline (./) (m: EffectfulCode<'codeT, 'raiseT, 'handleT>) (h: 'e -> EffectfulCode<'resumeT, 'handlerRaiseT, 'handlerHandleT>) =
         handle_with h m
-    let inline (.()) (m: EffectfulCode<'T>) =
-        run_effectful_code m
+    let inline (.()) (m: EffectfulCode<'codeT, 'raiseT, 'handleT>) =
+        (compile m)()
