@@ -4,7 +4,7 @@ open System
 open Microsoft.VisualStudio.TestTools.UnitTesting
 
 let ef = new EffectfulCode.CodeBuilder()
-let with_handler = new EffectfulCode.AddHandlerBuilder()
+let withHandler = new EffectfulCode.AddHandlerBuilder()
 
 type Eff1 = Eff1 of int
 type Eff2 = Eff2 of int
@@ -17,15 +17,10 @@ let example1 =
         let! (z: float) = ef { yield Eff1 11 }
         return x, y, z
     }
-"""
-{
-    yield Eff3 -> { yield Eff1; return Double }
-} with handler: 
-""" |> ignore;;
 
 let example2 =
     ef {
-        let! x = ef { return 1 }
+        let! (x: int) = ef { return 1 }
         let! (y: float) = ef { yield Eff2 100 }
         let! (z: float) = ef { yield Eff1 9 }
         return x, y, z
@@ -37,7 +32,7 @@ let example3 =
 
         let! (y: float) =
             ef { yield Eff2 100 }
-            |> with_handler.Add(fun (Eff2 x) -> ef { return x |> float |> (*) 50.0 })
+            |> withHandler.Add(fun (Eff2 x) -> ef { return x |> float |> (*) 50.0 })
 
         let! (z: float) = ef { yield Eff1 9 }
         return x, y, z
@@ -59,22 +54,22 @@ let eff4handler (Eff4 x) = ef { return (x, x + 1) }
 
 let example4 =
     ef {
-        let! r = ef { yield Eff4 9 }
+        let! (r: int * int) = ef { yield Eff4 9 }
         return r
     }
 
 let example2h12 =
-    with_handler {
-        return! example2
-        yield! eff2handler
-        yield! eff1handler
+    withHandler {
+        return example2
+        yield eff2handler
+        yield eff1handler
     }
 
 let example2h21 =
-    with_handler {
-        return! example2
-        yield! eff2handler
-        yield! eff1handler
+    withHandler {
+        return example2
+        yield eff2handler
+        yield eff1handler
     }
 
 [<TestClass>]
@@ -88,12 +83,13 @@ type TestSimple() =
     [<TestMethod>]
     member self.Test2() =
         let r =
-            with_handler {
-                return! example1
-                yield! eff3handler
-                yield! eff2handler
-                yield! eff1handler
+            withHandler {
+                return example1
+                yield eff3handler
+                yield eff2handler
+                yield eff1handler
             }
+
         Assert.AreEqual(r, (1, 990.0, 1.1))
 
     [<TestMethod>]

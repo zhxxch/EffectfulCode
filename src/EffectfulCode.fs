@@ -1,6 +1,23 @@
+(* EffectfulCode.fs - one-shot algebraic effects for F#
+
+Copyright (C) 2024 github.com/zhxxch
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program.  If not, see <https://www.gnu.org/licenses/>. *)
+
 module EffectfulCode
 
-//#nowarn "3513" // warning FS3513: 可恢复的代码调用。如果要根据现有可恢复代码定义新的低级别可恢复代码，请取消显示此警告。
+#nowarn "3513" // warning FS3513: 可恢复的代码调用。如果要根据现有可恢复代码定义新的低级别可恢复代码，请取消显示此警告。
 
 open System.Runtime.CompilerServices
 open Microsoft.FSharp.Core
@@ -27,12 +44,7 @@ type EffectfulCode<'codeT, 'raiseT, 'handleT> =
     ResumableCode<EffectfulCodeState, EffectfulCodeType<'codeT, 'raiseT, 'handleT>>
 
 module DynamicCode =
-    let inline combine
-        (
-            sm: byref<EffectfulCodeSM>,
-            code1: EffectfulCode<'code1T, 'raise1T, 'handle1T>,
-            code2: EffectfulCode<'code2T, 'raise2T, 'handle2T>
-        ) =
+    let inline combine (sm: byref<EffectfulCodeSM>, code1: EffectfulCode<_, _, _>, code2: EffectfulCode<_, _, _>) =
         if code1.Invoke(&sm) then
             code2.Invoke(&sm)
         else
@@ -50,7 +62,7 @@ module DynamicCode =
     let inline bind
         (
             sm: byref<EffectfulCodeSM>,
-            code: EffectfulCode<'codeT, 'codeRaiseT, 'codeHandleT>,
+            code: EffectfulCode<'codeT, _, _>,
             cont: 'codeT -> EffectfulCode<'contT, 'contRaiseT, 'contHandleT>
         ) =
         combine (
@@ -64,7 +76,7 @@ module DynamicCode =
 
     let rec handle
         (sm: byref<EffectfulCodeSM>)
-        (handler: 'e -> EffectfulCode<'h, 'hr, 'hh>)
+        (handler: 'e -> EffectfulCode<_, _, _>)
         (code: EffectfulCode<'c, 'cr, 'ch>)
         =
         let __stack_code_fin = code.Invoke(&sm)
@@ -120,7 +132,7 @@ module TypeCheck =
         else
             None
 
-    let tryFindUnhandled (code: EffectfulCode<'codeT, 'raiseT, 'handleT>) =
+    let tryFindUnhandled (code: EffectfulCode<_, 'raiseT, 'handleT>) =
         recursiveChecker [] [] (typeof<'raiseT>, typeof<'handleT>)
 
     let printUnhandledCode (raising, handle_stack, raise_stack) =
@@ -145,8 +157,8 @@ module TypeCheck =
         [| [| "in EffectfulCode:"; "{" |]
            Array.map indent raise_code
            [| "}"; "with handlers:" |]
-           List.toArray handle_code |> Array.map indent;
-           Array.singleton ""|]
+           List.toArray handle_code |> Array.map indent
+           Array.singleton "" |]
         |> Array.concat
         |> String.concat "\n"
 
@@ -165,7 +177,7 @@ let inline addHandler
 
 exception UnhandledEffect of string
 
-let inline compile (code: EffectfulCode<'codeT, 'raiseT, 'handleT>) =
+let inline compile (code: EffectfulCode<'codeT, _, _>) =
     match TypeCheck.tryFindUnhandled code with
     | Some e -> raise (UnhandledEffect(TypeCheck.printUnhandledCode e))
     | None -> ()
@@ -219,18 +231,17 @@ type CodeBuilder() =
         EffectfulCode<'contT, 'codeRaiseT * 'contRaiseT, 'codeHandleT * 'contHandleT>(fun sm ->
             DynamicCode.bind (&sm, code, cont))
 
+    member inline __.Compile code = compile code
+
 type AddHandlerBuilder() =
     member inline __.Delay g = g ()
-
     member inline __.Combine(handlerAdder1, handlerAdder2) = handlerAdder1 >> handlerAdder2
 
     member inline __.Combine(code, handlerAdder) = handlerAdder code
 
-    member inline __.ReturnFrom(code: EffectfulCode<'codeT, 'codeRaiseT, 'codeHandleT>) = code
+    member inline __.Return(code: EffectfulCode<_, _, _>) = code
 
-    member inline __.YieldFrom(handler: 'e -> EffectfulCode<'resumeT, 'handlerRaiseT, 'handlerHandleT>) =
-        addHandler handler
-
-    member inline self.Add handler = self.YieldFrom handler
-
-    member inline __.Run code = compile code ()
+    member inline __.Yield(handler: _ -> EffectfulCode<_, _, _>) = addHandler handler
+    member inline __.Run(code: EffectfulCode<_, _, _>) = compile code ()
+    member inline __.Run(handlerAdder: EffectfulCode<_, _, _> -> EffectfulCode<_, _, _>) = handlerAdder
+    member inline self.Add handler = self.Yield handler
