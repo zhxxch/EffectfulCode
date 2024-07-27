@@ -3,7 +3,7 @@ module EffectfulCode.Test
 open System
 open Microsoft.VisualStudio.TestTools.UnitTesting
 
-let ef = new EffectfulCode.Builder()
+let ef = new EffectfulCode.CodeBuilder()
 let with_handler = new EffectfulCode.AddHandlerBuilder()
 
 type Eff1 = Eff1 of int
@@ -17,6 +17,11 @@ let example1 =
         let! (z: float) = ef { yield Eff1 11 }
         return x, y, z
     }
+"""
+{
+    yield Eff3 -> { yield Eff1; return Double }
+} with handler: 
+""" |> ignore;;
 
 let example2 =
     ef {
@@ -32,7 +37,7 @@ let example3 =
 
         let! (y: float) =
             ef { yield Eff2 100 }
-            |> ef.With(fun (Eff2 x) -> ef { return x |> float |> (*) 50.0 })
+            |> with_handler.Add(fun (Eff2 x) -> ef { return x |> float |> (*) 50.0 })
 
         let! (z: float) = ef { yield Eff1 9 }
         return x, y, z
@@ -60,16 +65,16 @@ let example4 =
 
 let example2h12 =
     with_handler {
-        yield! eff1handler
-        yield! eff2handler
         return! example2
+        yield! eff2handler
+        yield! eff1handler
     }
 
 let example2h21 =
     with_handler {
+        return! example2
         yield! eff2handler
         yield! eff1handler
-        return! example2
     }
 
 [<TestClass>]
@@ -84,12 +89,11 @@ type TestSimple() =
     member self.Test2() =
         let r =
             with_handler {
-                yield! eff1handler
-                yield! eff2handler
-                yield! eff3handler
                 return! example1
+                yield! eff3handler
+                yield! eff2handler
+                yield! eff1handler
             }
-
         Assert.AreEqual(r, (1, 990.0, 1.1))
 
     [<TestMethod>]

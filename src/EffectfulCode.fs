@@ -7,37 +7,16 @@ open Microsoft.FSharp.Core
 open Microsoft.FSharp.Core.CompilerServices
 open Microsoft.FSharp.Core.CompilerServices.StateMachineHelpers
 
+[<Struct>]
 type EffectfulCodeState =
-    | NoEffect
-    | Raising of obj * System.Type
-    | Resuming of System.Type * (obj * System.Type)
+    { mutable Value: obj
+      mutable EffectType: System.Type }
 
 type EffectfulCodeType<'codeT, 'raiseT, 'handleT> = 'codeT * 'raiseT * 'handleT
 
 type Effect<'raiseT, 'resumeT> =
     | RaisingT of 'raiseT
     | ResumingT of 'resumeT
-
-let unbox_resumed<'T> effectful_code_state =
-    match effectful_code_state with
-    | Resuming(e_typ, (r_obj, r_typ)) ->
-        if r_typ = typeof<'T> then
-            Some(Unchecked.unbox<'T> r_obj)
-        else
-            failwith (sprintf "mismatch handler result type! expect: %A; fact: %A." typeof<'T> r_typ)
-            None
-    | _ ->
-        failwith (sprintf "handler not resume! expect %A; fact: %A." typeof<'T> effectful_code_state)
-        None
-
-let unbox_raised<'T> effectful_code_state =
-    match effectful_code_state with
-    | Raising(e_obj, e_typ) ->
-        if e_typ = typeof<'T> then
-            Some(Unchecked.unbox<'T> e_obj)
-        else
-            None
-    | _ -> None
 
 type EffectfulCodeSM = ResumableStateMachine<EffectfulCodeState>
 type EffectfulResumptionFunc = ResumptionFunc<EffectfulCodeState>
@@ -78,13 +57,9 @@ module DynamicCode =
             &sm,
             code,
             EffectfulCode<'contT, 'contRaiseT, 'contHandleT>(fun sm' ->
-                let resumed = unbox_resumed<'codeT> sm'.Data
-
-                match resumed with
-                | Some r ->
-                    sm'.Data <- NoEffect
-                    (cont r).Invoke(&sm')
-                | _ -> false)
+                let resumed = Unchecked.unbox<'codeT> sm'.Data.Value
+                sm'.Data.EffectType <- typeof<unit>
+                (cont resumed).Invoke(&sm'))
         )
 
     let rec handle
@@ -96,47 +71,84 @@ module DynamicCode =
 
         if __stack_code_fin then
             true
-        else
-            let raised = unbox_raised<'e> sm.Data
+        elif sm.Data.EffectType <> typeof<'e> then
             let rf = sm.ResumptionDynamicInfo.ResumptionFunc
 
             sm.ResumptionDynamicInfo.ResumptionFunc <-
-                match raised with
-                | Some e ->
-                    EffectfulResumptionFunc(fun sm ->
-                        combine (
-                            &sm,
-                            (handler e),
-                            EffectfulCode<'c, 'cr, 'ch>(fun sm ->
-                                (handle &sm handler (EffectfulCode<'c, 'cr, 'ch>(fun sm -> rf.Invoke(&sm)))))
-                        ))
-                | _ ->
-                    EffectfulResumptionFunc(fun sm ->
-                        (handle &sm handler (EffectfulCode<'c, 'cr, 'ch>(fun sm -> rf.Invoke(&sm)))))
+                EffectfulResumptionFunc(fun sm' ->
+                    handle &sm' handler (EffectfulCode<'c, 'cr, 'ch>(fun sm'' -> rf.Invoke(&sm''))))
+
+            false
+        else
+            let raised = Unchecked.unbox<'e> sm.Data.Value
+            let rf = sm.ResumptionDynamicInfo.ResumptionFunc
+
+            sm.ResumptionDynamicInfo.ResumptionFunc <-
+                EffectfulResumptionFunc(fun sm ->
+                    combine (
+                        &sm,
+                        handler raised,
+                        EffectfulCode<'c, 'cr, 'ch>(fun sm ->
+                            handle &sm handler (EffectfulCode<'c, 'cr, 'ch>(fun sm -> rf.Invoke(&sm))))
+                    ))
 
             false
 
 module TypeCheck =
     open FSharp.Reflection
 
-    let rec recursiveChecker (handle_stack: System.Type list) (raising: System.Type, resuming: System.Type) =
-        if FSharpType.IsFunction resuming then
-            let handled_eff, resuming_tail = FSharpType.GetFunctionElements resuming
-            recursiveChecker (handled_eff :: handle_stack) (raising, resuming_tail)
+    let rec recursiveChecker
+        (handle_stack: System.Type list)
+        (raise_stack: System.Type list)
+        (raising: System.Type, resuming: System.Type)
+        =
+        if FSharpType.IsFunction raising then
+            let raised_eff, handler_raising = FSharpType.GetFunctionElements raising
+            recursiveChecker handle_stack (raised_eff :: raise_stack) (handler_raising, resuming)
+        elif FSharpType.IsFunction resuming then
+            let handled_eff, handler_resuming = FSharpType.GetFunctionElements resuming
+            recursiveChecker (handled_eff :: handle_stack) raise_stack (raising, handler_resuming)
         elif FSharpType.IsTuple raising then
             let raising_arr = FSharpType.GetTupleElements raising
             let resuming_arr = FSharpType.GetTupleElements resuming
-            Array.tryPick (recursiveChecker handle_stack) (Array.zip raising_arr resuming_arr)
+            Array.tryPick (recursiveChecker handle_stack raise_stack) (Array.zip raising_arr resuming_arr)
         elif raising <> typeof<unit> then
             if List.contains raising handle_stack then
                 None
             else
-                Some(raising, handle_stack)
+                Some(raising, handle_stack, raise_stack)
         else
             None
 
     let tryFindUnhandled (code: EffectfulCode<'codeT, 'raiseT, 'handleT>) =
-        recursiveChecker [] (typeof<'raiseT>, typeof<'handleT>)
+        recursiveChecker [] [] (typeof<'raiseT>, typeof<'handleT>)
+
+    let printUnhandledCode (raising, handle_stack, raise_stack) =
+        let indent (s: string) = "    " + s
+
+        let printEffectType (t: System.Type) =
+            let genArgs = t.GetGenericArguments()
+            sprintf "%s -> %s" genArgs.[0].Name genArgs.[1].Name
+
+        let folder (folded: string array) (curr: System.Type) =
+            Array.concat
+                [| Array.singleton (sprintf "yield %s {" (printEffectType curr))
+                   Array.map indent folded
+                   Array.singleton "}" |]
+
+        let raise_code =
+            raise_stack
+            |> List.fold folder [| sprintf "yield %s // unhandled" (printEffectType raising) |]
+
+        let handle_code = List.map printEffectType handle_stack
+
+        [| [| "in EffectfulCode:"; "{" |]
+           Array.map indent raise_code
+           [| "}"; "with handlers:" |]
+           List.toArray handle_code |> Array.map indent;
+           Array.singleton ""|]
+        |> Array.concat
+        |> String.concat "\n"
 
     let check code = tryFindUnhandled code |> Option.isNone
 
@@ -144,10 +156,20 @@ let inline addHandler
     (handler: 'e -> EffectfulCode<'resumeT, 'handlerRaiseT, 'handlerHandleT>)
     (code: EffectfulCode<'codeT, 'codeRaiseT, 'codeHandleT>)
     =
-    EffectfulCode<'codeT, 'codeRaiseT * 'handlerRaiseT, (Effect<'e, 'resumeT> -> 'codeHandleT) * 'handlerHandleT>
+    EffectfulCode<
+        'codeT,
+        'codeRaiseT * (Effect<'e, 'resumeT> -> 'handlerRaiseT),
+        (Effect<'e, 'resumeT> -> 'codeHandleT) * 'handlerHandleT
+     >
         (fun sm -> DynamicCode.handle &sm handler code)
 
+exception UnhandledEffect of string
+
 let inline compile (code: EffectfulCode<'codeT, 'raiseT, 'handleT>) =
+    match TypeCheck.tryFindUnhandled code with
+    | Some e -> raise (UnhandledEffect(TypeCheck.printUnhandledCode e))
+    | None -> ()
+
     let initialResumptionFunc = EffectfulResumptionFunc(fun sm -> code.Invoke(&sm))
 
     let resumptionInfo =
@@ -160,24 +182,15 @@ let inline compile (code: EffectfulCode<'codeT, 'raiseT, 'handleT>) =
 
     let mutable sm = new EffectfulCodeSM()
     sm.ResumptionDynamicInfo <- resumptionInfo
-    sm.Data <- NoEffect
+    sm.Data.EffectType <- typeof<unit>
 
     fun () ->
         while sm.ResumptionPoint <> -1 do
             sm.ResumptionDynamicInfo.MoveNext(&sm)
 
-        match sm.Data with
-        | Resuming(e_typ, (r_obj, r_typ)) -> unbox<'codeT> r_obj
-        | _ -> failwith "unhandled"
+        Unchecked.unbox<'codeT> sm.Data.Value
 
-let inline run sm = sm ()
-
-type Builder() =
-    (*
-    member inline __.Delay (generator:
-        unit -> EffectfulCode<'codeT, 'raiseT, 'handleT>) =
-        ResumableCode.Delay generator
-        *)
+type CodeBuilder() =
     member inline __.Combine
         (code1: EffectfulCode<'code1T, 'raise1T, 'handle1T>, code2: EffectfulCode<'code2T, 'raise2T, 'handle2T>)
         =
@@ -186,17 +199,19 @@ type Builder() =
 
     member inline __.Return(x: 'T) =
         EffectfulCode<'T, unit, unit>(fun sm ->
-            sm.Data <- Resuming(typeof<unit>, (box x, typeof<'T>))
+            sm.Data.Value <- box x
+            sm.Data.EffectType <- typeof<unit>
             true)
 
     member inline self.Zero() = self.Return(())
 
     member inline __.Yield(x: 'raiseT) =
         EffectfulCode<'T, Effect<'raiseT, 'T>, unit>(fun sm ->
-            sm.Data <- Raising((box x), typeof<'raiseT>)
+            sm.Data.Value <- box x
+            sm.Data.EffectType <- typeof<'raiseT>
             ResumableCode.Yield().Invoke(&sm))
 
-    member inline self.Bind
+    member inline __.Bind
         (
             code: EffectfulCode<'codeT, 'codeRaiseT, 'codeHandleT>,
             cont: 'codeT -> EffectfulCode<'contT, 'contRaiseT, 'contHandleT>
@@ -204,40 +219,18 @@ type Builder() =
         EffectfulCode<'contT, 'codeRaiseT * 'contRaiseT, 'codeHandleT * 'contHandleT>(fun sm ->
             DynamicCode.bind (&sm, code, cont))
 
-    member inline __.With
-        (handler: 'e -> EffectfulCode<'resumeT, 'handlerRaiseT, 'handlerHandleT>)
-        (code: EffectfulCode<'codeT, 'codeRaiseT, 'codeHandleT>)
-        =
-        addHandler handler code
-
 type AddHandlerBuilder() =
     member inline __.Delay g = g ()
 
-    member inline __.Combine
-        (
-            handler: 'e -> EffectfulCode<'resumeT, 'handlerRaiseT, 'handlerHandleT>,
-            code: EffectfulCode<'codeT, 'codeRaiseT, 'codeHandleT>
-        ) =
-        addHandler handler code
+    member inline __.Combine(handlerAdder1, handlerAdder2) = handlerAdder1 >> handlerAdder2
+
+    member inline __.Combine(code, handlerAdder) = handlerAdder code
 
     member inline __.ReturnFrom(code: EffectfulCode<'codeT, 'codeRaiseT, 'codeHandleT>) = code
-    member inline __.YieldFrom(handler: 'e -> EffectfulCode<'resumeT, 'handlerRaiseT, 'handlerHandleT>) = handler
 
-    member inline __.Run code =
-        match TypeCheck.tryFindUnhandled code with
-        | Some e -> failwith (sprintf "Unhandled %A" e)
-        | None -> compile code ()
-(*
-C:\Users\zhxxc\Documents\Source\zxc.fs\src\EffectfulCode.fs(56,12): warning FS3513: 可恢复的代码调用。如果要根据现有可恢复代码定 义新的低级别可恢复代码，请取消显示此警告。
-[C:\Users\zhxxc\Documents\Source\zxc.fs\src\EffectfulCode.fsproj]
-C:\Users\zhxxc\Documents\Source\zxc.fs\src\EffectfulCode.fs(56,35): warning FS3513: 可恢复的代码调用。如果要根据现有可恢复代码定 义新的低级别可恢复代码，请取消显示此警告。
-[C:\Users\zhxxc\Documents\Source\zxc.fs\src\EffectfulCode.fsproj]
-C:\Users\zhxxc\Documents\Source\zxc.fs\src\EffectfulCode.fs(61,26): warning FS3513: 可恢复的代码调用。如果要根据现有可恢复代码定 义新的低级别可恢复代码，请取消显示此警告。
-[C:\Users\zhxxc\Documents\Source\zxc.fs\src\EffectfulCode.fsproj]
-C:\Users\zhxxc\Documents\Source\zxc.fs\src\EffectfulCode.fs(88,32): warning FS3513: 可恢复的代码调用。如果要根据现有可恢复代码定 义新的低级别可恢复代码，请取消显示此警告。
-[C:\Users\zhxxc\Documents\Source\zxc.fs\src\EffectfulCode.fsproj]
-C:\Users\zhxxc\Documents\Source\zxc.fs\src\EffectfulCode.fs(131,67): warning FS3513: 可恢复的代码调用。如果要根据现有可恢复代码定义新的低级别可恢复代码，请取消显示此警告。
- [C:\Users\zhxxc\Documents\Source\zxc.fs\src\EffectfulCode.fsproj]
-    5 个警告
-    0 个错误
-*)
+    member inline __.YieldFrom(handler: 'e -> EffectfulCode<'resumeT, 'handlerRaiseT, 'handlerHandleT>) =
+        addHandler handler
+
+    member inline self.Add handler = self.YieldFrom handler
+
+    member inline __.Run code = compile code ()
