@@ -60,14 +60,14 @@ let example4 =
 
 let example2h12 =
     withHandler {
-        return example2
+        return! example2
         yield eff2handler
         yield eff1handler
     }
 
 let example2h21 =
     withHandler {
-        return example2
+        return! example2
         yield eff2handler
         yield eff1handler
     }
@@ -84,7 +84,7 @@ type TestSimple() =
     member self.Test2() =
         let r =
             withHandler {
-                return example1
+                return! example1
                 yield eff3handler
                 yield eff2handler
                 yield eff1handler

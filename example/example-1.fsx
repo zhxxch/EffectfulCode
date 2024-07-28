@@ -96,7 +96,7 @@ example1'
 
 // add handlers(alternative way & different handlers)
 withHandler {
-    return example1'
+    return! example1'
     yield h_add_tropical
     yield h_mul_tropical
     yield h_log
@@ -105,7 +105,7 @@ withHandler {
 
 // trying to run effectful code with any unhandled effect raises an exception
 withHandler {
-    return example1'
+    return! example1'
     yield h_log
     yield h_add_tropical
     yield h_mul_tropical

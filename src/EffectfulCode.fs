@@ -29,22 +29,17 @@ type EffectfulCodeState =
     { mutable Value: obj
       mutable EffectType: System.Type }
 
-type EffectfulCodeType<'codeT, 'raiseT, 'handleT> = 'codeT * 'raiseT * 'handleT
-
-type Effect<'raiseT, 'resumeT> =
-    | RaisingT of 'raiseT
-    | ResumingT of 'resumeT
+type NoEffect = NoEffect
+exception UnhandledEffect of string
 
 type EffectfulCodeSM = ResumableStateMachine<EffectfulCodeState>
 type EffectfulResumptionFunc = ResumptionFunc<EffectfulCodeState>
 type EffectfulResumptionDynamicInfo = ResumptionDynamicInfo<EffectfulCodeState>
 
-/// 'codeT: resumable code fragment result type
-type EffectfulCode<'codeT, 'raiseT, 'handleT> =
-    ResumableCode<EffectfulCodeState, EffectfulCodeType<'codeT, 'raiseT, 'handleT>>
+type EffectfulCode<'codeT> = ResumableCode<EffectfulCodeState, 'codeT>
 
 module DynamicCode =
-    let inline combine (sm: byref<EffectfulCodeSM>, code1: EffectfulCode<_, _, _>, code2: EffectfulCode<_, _, _>) =
+    let inline combine (sm: byref<EffectfulCodeSM>, code1: EffectfulCode<_>, code2: EffectfulCode<_>) =
         if code1.Invoke(&sm) then
             code2.Invoke(&sm)
         else
@@ -59,26 +54,19 @@ module DynamicCode =
             sm.ResumptionDynamicInfo.ResumptionFunc <- (resume (sm.ResumptionDynamicInfo.ResumptionFunc))
             false
 
-    let inline bind
-        (
-            sm: byref<EffectfulCodeSM>,
-            code: EffectfulCode<'codeT, _, _>,
-            cont: 'codeT -> EffectfulCode<'contT, 'contRaiseT, 'contHandleT>
-        ) =
+    let inline bind (sm: byref<EffectfulCodeSM>, code: EffectfulCode<'codeT>, cont: 'codeT -> EffectfulCode<'contT>) =
         combine (
             &sm,
             code,
-            EffectfulCode<'contT, 'contRaiseT, 'contHandleT>(fun sm' ->
+            EffectfulCode<'contT>(fun sm' ->
+                if sm'.Data.EffectType <> typeof<NoEffect> then
+                    raise (UnhandledEffect sm'.Data.EffectType.Name)
+
                 let resumed = Unchecked.unbox<'codeT> sm'.Data.Value
-                sm'.Data.EffectType <- typeof<unit>
                 (cont resumed).Invoke(&sm'))
         )
 
-    let rec handle
-        (sm: byref<EffectfulCodeSM>)
-        (handler: 'e -> EffectfulCode<_, _, _>)
-        (code: EffectfulCode<'c, 'cr, 'ch>)
-        =
+    let rec handle (sm: byref<EffectfulCodeSM>) (handler: 'e -> EffectfulCode<_>) (code: EffectfulCode<'c>) =
         let __stack_code_fin = code.Invoke(&sm)
 
         if __stack_code_fin then
@@ -88,7 +76,7 @@ module DynamicCode =
 
             sm.ResumptionDynamicInfo.ResumptionFunc <-
                 EffectfulResumptionFunc(fun sm' ->
-                    handle &sm' handler (EffectfulCode<'c, 'cr, 'ch>(fun sm'' -> rf.Invoke(&sm''))))
+                    handle &sm' handler (EffectfulCode<'c>(fun sm'' -> rf.Invoke(&sm''))))
 
             false
         else
@@ -100,87 +88,15 @@ module DynamicCode =
                     combine (
                         &sm,
                         handler raised,
-                        EffectfulCode<'c, 'cr, 'ch>(fun sm ->
-                            handle &sm handler (EffectfulCode<'c, 'cr, 'ch>(fun sm -> rf.Invoke(&sm))))
+                        EffectfulCode<'c>(fun sm -> handle &sm handler (EffectfulCode<'c>(fun sm -> rf.Invoke(&sm))))
                     ))
 
             false
 
-module TypeCheck =
-    open FSharp.Reflection
+let inline addHandler (handler: 'e -> EffectfulCode<'resumeT>) (code: EffectfulCode<'codeT>) =
+    EffectfulCode<'codeT>(fun sm -> DynamicCode.handle &sm handler code)
 
-    let rec recursiveChecker
-        (handle_stack: System.Type list)
-        (raise_stack: System.Type list)
-        (raising: System.Type, resuming: System.Type)
-        =
-        if FSharpType.IsFunction raising then
-            let raised_eff, handler_raising = FSharpType.GetFunctionElements raising
-            recursiveChecker handle_stack (raised_eff :: raise_stack) (handler_raising, resuming)
-        elif FSharpType.IsFunction resuming then
-            let handled_eff, handler_resuming = FSharpType.GetFunctionElements resuming
-            recursiveChecker (handled_eff :: handle_stack) raise_stack (raising, handler_resuming)
-        elif FSharpType.IsTuple raising then
-            let raising_arr = FSharpType.GetTupleElements raising
-            let resuming_arr = FSharpType.GetTupleElements resuming
-            Array.tryPick (recursiveChecker handle_stack raise_stack) (Array.zip raising_arr resuming_arr)
-        elif raising <> typeof<unit> then
-            if List.contains raising handle_stack then
-                None
-            else
-                Some(raising, handle_stack, raise_stack)
-        else
-            None
-
-    let tryFindUnhandled (code: EffectfulCode<_, 'raiseT, 'handleT>) =
-        recursiveChecker [] [] (typeof<'raiseT>, typeof<'handleT>)
-
-    let printUnhandledCode (raising, handle_stack, raise_stack) =
-        let indent (s: string) = "    " + s
-
-        let printEffectType (t: System.Type) =
-            let genArgs = t.GetGenericArguments()
-            sprintf "%s -> %s" genArgs.[0].Name genArgs.[1].Name
-
-        let folder (folded: string array) (curr: System.Type) =
-            Array.concat
-                [| Array.singleton (sprintf "yield %s {" (printEffectType curr))
-                   Array.map indent folded
-                   Array.singleton "}" |]
-
-        let raise_code =
-            raise_stack
-            |> List.fold folder [| sprintf "yield %s // unhandled" (printEffectType raising) |]
-
-        let handle_code = List.map printEffectType handle_stack
-
-        [| [| "in EffectfulCode:"; "{" |]
-           Array.map indent raise_code
-           [| "}"; "with handlers:" |]
-           List.toArray handle_code |> Array.map indent
-           Array.singleton "" |]
-        |> Array.concat
-        |> String.concat "\n"
-
-    let check code = tryFindUnhandled code |> Option.isNone
-
-let inline addHandler
-    (handler: 'e -> EffectfulCode<'resumeT, 'handlerRaiseT, 'handlerHandleT>)
-    (code: EffectfulCode<'codeT, 'codeRaiseT, 'codeHandleT>)
-    =
-    EffectfulCode<
-        'codeT,
-        'codeRaiseT * (Effect<'e, 'resumeT> -> 'handlerRaiseT),
-        (Effect<'e, 'resumeT> -> 'codeHandleT) * 'handlerHandleT
-     >
-        (fun sm -> DynamicCode.handle &sm handler code)
-
-exception UnhandledEffect of string
-
-let inline compile (code: EffectfulCode<'codeT, _, _>) =
-    match TypeCheck.tryFindUnhandled code with
-    | Some e -> raise (UnhandledEffect(TypeCheck.printUnhandledCode e))
-    | None -> ()
+let inline compile (code: EffectfulCode<'codeT>) =
 
     let initialResumptionFunc = EffectfulResumptionFunc(fun sm -> code.Invoke(&sm))
 
@@ -194,7 +110,7 @@ let inline compile (code: EffectfulCode<'codeT, _, _>) =
 
     let mutable sm = new EffectfulCodeSM()
     sm.ResumptionDynamicInfo <- resumptionInfo
-    sm.Data.EffectType <- typeof<unit>
+    sm.Data.EffectType <- typeof<NoEffect>
 
     fun () ->
         while sm.ResumptionPoint <> -1 do
@@ -203,34 +119,36 @@ let inline compile (code: EffectfulCode<'codeT, _, _>) =
         Unchecked.unbox<'codeT> sm.Data.Value
 
 type CodeBuilder() =
-    member inline __.Combine
-        (code1: EffectfulCode<'code1T, 'raise1T, 'handle1T>, code2: EffectfulCode<'code2T, 'raise2T, 'handle2T>)
-        =
-        EffectfulCode<'code2T, 'raise1T * 'raise2T, 'handle1T * 'handle2T>(fun sm ->
-            DynamicCode.combine (&sm, code1, code2))
+    member inline __.Delay(g: unit -> EffectfulCode<'T>) = ResumableCode.Delay g
+
+    member inline __.Combine(code1: EffectfulCode<unit>, code2: EffectfulCode<'codeT>) =
+        ResumableCode.Combine(code1, code2)
 
     member inline __.Return(x: 'T) =
-        EffectfulCode<'T, unit, unit>(fun sm ->
+        EffectfulCode<'T>(fun sm ->
             sm.Data.Value <- box x
-            sm.Data.EffectType <- typeof<unit>
+            sm.Data.EffectType <- typeof<NoEffect>
             true)
 
     member inline self.Zero() = self.Return(())
 
     member inline __.Yield(x: 'raiseT) =
-        EffectfulCode<'T, Effect<'raiseT, 'T>, unit>(fun sm ->
+        EffectfulCode<_>(fun sm ->
             sm.Data.Value <- box x
             sm.Data.EffectType <- typeof<'raiseT>
             ResumableCode.Yield().Invoke(&sm))
 
-    member inline __.Bind
-        (
-            code: EffectfulCode<'codeT, 'codeRaiseT, 'codeHandleT>,
-            cont: 'codeT -> EffectfulCode<'contT, 'contRaiseT, 'contHandleT>
-        ) =
-        EffectfulCode<'contT, 'codeRaiseT * 'contRaiseT, 'codeHandleT * 'contHandleT>(fun sm ->
-            DynamicCode.bind (&sm, code, cont))
+    member inline __.Bind(code: EffectfulCode<'codeT>, cont: 'codeT -> EffectfulCode<'contT>) =
+        EffectfulCode<'contT>(fun sm -> DynamicCode.bind (&sm, code, cont))
 
+    member inline __.While(cond: unit -> bool, code: EffectfulCode<unit>) = ResumableCode.While(cond, code)
+
+    member inline __.TryWith(code: EffectfulCode<'T>, catch: exn -> EffectfulCode<'T>) =
+        ResumableCode.TryWith(code, catch)
+
+    member inline __.TryFinally(code: EffectfulCode<'T>, fin: EffectfulCode<unit>) = ResumableCode.TryFinally(code, fin)
+    member inline __.Using(resource: 'T, code: 'T -> EffectfulCode<'codeT>) = ResumableCode.Using(resource, code)
+    member inline __.For(seq: seq<'T>, code: 'T -> EffectfulCode<unit>) = ResumableCode.For(seq, code)
     member inline __.Compile code = compile code
 
 type AddHandlerBuilder() =
@@ -239,9 +157,9 @@ type AddHandlerBuilder() =
 
     member inline __.Combine(code, handlerAdder) = handlerAdder code
 
-    member inline __.Return(code: EffectfulCode<_, _, _>) = code
+    member inline __.ReturnFrom(code: EffectfulCode<_>) = code
 
-    member inline __.Yield(handler: _ -> EffectfulCode<_, _, _>) = addHandler handler
-    member inline __.Run(code: EffectfulCode<_, _, _>) = compile code ()
-    member inline __.Run(handlerAdder: EffectfulCode<_, _, _> -> EffectfulCode<_, _, _>) = handlerAdder
+    member inline __.Yield(handler: _ -> EffectfulCode<_>) = addHandler handler
+    member inline __.Run(code: EffectfulCode<_>) = compile code ()
+    member inline __.Run(handlerAdder: EffectfulCode<_> -> EffectfulCode<_>) = handlerAdder
     member inline self.Add handler = self.Yield handler
