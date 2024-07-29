@@ -17,7 +17,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>. *)
 
 module EffectfulCode
 
-#nowarn "3513" // warning FS3513: 可恢复的代码调用。如果要根据现有可恢复代码定义新的低级别可恢复代码，请取消显示此警告。
+//#nowarn "3513" // warning FS3513: 可恢复的代码调用。如果要根据现有可恢复代码定义新的低级别可恢复代码，请取消显示此警告。
 
 open System.Runtime.CompilerServices
 open Microsoft.FSharp.Core
@@ -32,6 +32,7 @@ type EffectfulCodeState =
 type NoEffect = NoEffect
 exception UnhandledEffect of string
 
+type IEffectfulCodeSM = IResumableStateMachine<EffectfulCodeState>
 type EffectfulCodeSM = ResumableStateMachine<EffectfulCodeState>
 type EffectfulResumptionFunc = ResumptionFunc<EffectfulCodeState>
 type EffectfulResumptionDynamicInfo = ResumptionDynamicInfo<EffectfulCodeState>
@@ -93,28 +94,59 @@ module DynamicCode =
 
             false
 
+let inline async_sm_next(x: byref<'T> when 'T :> IAsyncStateMachine) = x.MoveNext()
+
 let inline addHandler (handler: 'e -> EffectfulCode<'resumeT>) (code: EffectfulCode<'codeT>) =
-    EffectfulCode<'codeT>(fun sm -> DynamicCode.handle &sm handler code)
+    EffectfulCode<'codeT>(fun sm -> 
+        if __useResumableCode
+        then
+            let __stack_fin1 = code.Invoke(&sm)
+            if __stack_fin1 then
+                true
+            elif sm.Data.EffectType <> typeof<'e> then
+                true
+            else
+                let code_resume_point = sm.ResumptionPoint
+                let raised = Unchecked.unbox<'e> sm.Data.Value
+                let __stack_fin2 = (handler raised).Invoke(&sm)
+                if __stack_fin2 then
+                    sm.ResumptionPoint <- code_resume_point
+                    false
+                else
+                    false
+        else
+            DynamicCode.handle &sm handler code
+    )
 
 let inline compile (code: EffectfulCode<'codeT>) =
+    if __useResumableCode
+    then
+        __stateMachine<EffectfulCodeState, 'codeT>
+            (MoveNextMethodImpl<_>(fun sm -> 
+                __resumeAt sm.ResumptionPoint
+                let __stack_code_fin = code.Invoke(&sm)
+                if __stack_code_fin then
+                    sm.ResumptionPoint  <- -1))
+            (SetStateMachineMethodImpl<_>(fun sm state -> ()))
+            (AfterCode<_,_>(fun sm ->
+                (async_sm_next &sm;(while sm.ResumptionPoint <> -1 do async_sm_next &sm);Unchecked.unbox<'codeT> sm.Data.Value)))
+    else
+        let initialResumptionFunc = EffectfulResumptionFunc(fun sm -> code.Invoke(&sm))
 
-    let initialResumptionFunc = EffectfulResumptionFunc(fun sm -> code.Invoke(&sm))
+        let resumptionInfo =
+            { new EffectfulResumptionDynamicInfo(initialResumptionFunc) with
+                member info.MoveNext(sm) =
+                    if info.ResumptionFunc.Invoke(&sm) then
+                        sm.ResumptionPoint <- -1
 
-    let resumptionInfo =
-        { new EffectfulResumptionDynamicInfo(initialResumptionFunc) with
-            member info.MoveNext(sm) =
-                if info.ResumptionFunc.Invoke(&sm) then
-                    sm.ResumptionPoint <- -1
+                member info.SetStateMachine(sm, state) = () }
 
-            member info.SetStateMachine(sm, state) = () }
-
-    let mutable sm = new EffectfulCodeSM()
-    sm.ResumptionDynamicInfo <- resumptionInfo
-    sm.Data.EffectType <- typeof<NoEffect>
-
-    fun () ->
+        let mutable sm = new EffectfulCodeSM()
+        sm.ResumptionDynamicInfo <- resumptionInfo
+        sm.Data.EffectType <- typeof<NoEffect>
+        
         while sm.ResumptionPoint <> -1 do
-            sm.ResumptionDynamicInfo.MoveNext(&sm)
+            async_sm_next &sm
 
         Unchecked.unbox<'codeT> sm.Data.Value
 
@@ -139,7 +171,18 @@ type CodeBuilder() =
             ResumableCode.Yield().Invoke(&sm))
 
     member inline __.Bind(code: EffectfulCode<'codeT>, cont: 'codeT -> EffectfulCode<'contT>) =
-        EffectfulCode<'contT>(fun sm -> DynamicCode.bind (&sm, code, cont))
+        EffectfulCode<'contT>(fun sm -> 
+            if __useResumableCode
+            then
+                let __stack_code_fin = code.Invoke(&sm)
+                if __stack_code_fin
+                then
+                    let resumed = Unchecked.unbox<'codeT> sm.Data.Value
+                    (cont resumed).Invoke(&sm)
+                else false
+            else
+                DynamicCode.bind (&sm, code, cont)
+        )
 
     member inline __.While(cond: unit -> bool, code: EffectfulCode<unit>) = ResumableCode.While(cond, code)
 
@@ -160,6 +203,16 @@ type AddHandlerBuilder() =
     member inline __.ReturnFrom(code: EffectfulCode<_>) = code
 
     member inline __.Yield(handler: _ -> EffectfulCode<_>) = addHandler handler
-    member inline __.Run(code: EffectfulCode<_>) = compile code ()
+    member inline __.Run(code: EffectfulCode<_>) = compile code
     member inline __.Run(handlerAdder: EffectfulCode<_> -> EffectfulCode<_>) = handlerAdder
     member inline self.Add handler = self.Yield handler
+
+module Test =
+    let ef = new CodeBuilder()
+    let withHandler = new AddHandlerBuilder()
+    type Add1Effect = Add1 of int
+    let inline h_add1 (Add1 x) = ef{return (x+1)}
+    let (a: unit->int) = fun () -> withHandler{
+        return! ef{let! x' = ef{yield Add1 9} in return x'}
+        yield h_add1
+    }
