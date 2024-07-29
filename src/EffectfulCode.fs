@@ -1,4 +1,4 @@
-(* EffectfulCode.fs - one-shot algebraic effects for F#
+﻿(* EffectfulCode.fs - one-shot algebraic effects for F#
 
 Copyright (C) 2024 github.com/zhxxch
 
@@ -121,7 +121,7 @@ let inline addHandler (handler: 'e -> EffectfulCode<'resumeT>) (code: EffectfulC
 let inline compile (code: EffectfulCode<'codeT>) =
     if __useResumableCode
     then
-        __stateMachine<EffectfulCodeState, 'codeT>
+        fun () -> (__stateMachine<EffectfulCodeState, 'codeT>
             (MoveNextMethodImpl<_>(fun sm -> 
                 __resumeAt sm.ResumptionPoint
                 let __stack_code_fin = code.Invoke(&sm)
@@ -129,7 +129,9 @@ let inline compile (code: EffectfulCode<'codeT>) =
                     sm.ResumptionPoint  <- -1))
             (SetStateMachineMethodImpl<_>(fun sm state -> ()))
             (AfterCode<_,_>(fun sm ->
-                (async_sm_next &sm;(while sm.ResumptionPoint <> -1 do async_sm_next &sm);Unchecked.unbox<'codeT> sm.Data.Value)))
+                async_sm_next &sm
+                while sm.ResumptionPoint <> -1 do async_sm_next &sm
+                Unchecked.unbox<'codeT> sm.Data.Value)))
     else
         let initialResumptionFunc = EffectfulResumptionFunc(fun sm -> code.Invoke(&sm))
 
@@ -141,14 +143,13 @@ let inline compile (code: EffectfulCode<'codeT>) =
 
                 member info.SetStateMachine(sm, state) = () }
 
-        let mutable sm = new EffectfulCodeSM()
-        sm.ResumptionDynamicInfo <- resumptionInfo
-        sm.Data.EffectType <- typeof<NoEffect>
-        
-        while sm.ResumptionPoint <> -1 do
-            async_sm_next &sm
-
-        Unchecked.unbox<'codeT> sm.Data.Value
+        fun () ->
+            let mutable sm = new EffectfulCodeSM()
+            sm.ResumptionDynamicInfo <- resumptionInfo
+            sm.Data.EffectType <- typeof<NoEffect>
+            while sm.ResumptionPoint <> -1 do
+                async_sm_next &sm
+            Unchecked.unbox<'codeT> sm.Data.Value
 
 type CodeBuilder() =
     member inline __.Delay(g: unit -> EffectfulCode<'T>) = ResumableCode.Delay g
@@ -192,7 +193,6 @@ type CodeBuilder() =
     member inline __.TryFinally(code: EffectfulCode<'T>, fin: EffectfulCode<unit>) = ResumableCode.TryFinally(code, fin)
     member inline __.Using(resource: 'T, code: 'T -> EffectfulCode<'codeT>) = ResumableCode.Using(resource, code)
     member inline __.For(seq: seq<'T>, code: 'T -> EffectfulCode<unit>) = ResumableCode.For(seq, code)
-    member inline __.Compile code = compile code
 
 type AddHandlerBuilder() =
     member inline __.Delay g = g ()
@@ -200,19 +200,11 @@ type AddHandlerBuilder() =
 
     member inline __.Combine(code, handlerAdder) = handlerAdder code
 
+    member inline __.ReturnFrom(code: unit -> EffectfulCode<_>) = code ()
+    
     member inline __.ReturnFrom(code: EffectfulCode<_>) = code
-
     member inline __.Yield(handler: _ -> EffectfulCode<_>) = addHandler handler
+    member inline __.Run([<InlineIfLambda>]code: unit -> EffectfulCode<_>) = compile (code ())
     member inline __.Run(code: EffectfulCode<_>) = compile code
+    
     member inline __.Run(handlerAdder: EffectfulCode<_> -> EffectfulCode<_>) = handlerAdder
-    member inline self.Add handler = self.Yield handler
-
-module Test =
-    let ef = new CodeBuilder()
-    let withHandler = new AddHandlerBuilder()
-    type Add1Effect = Add1 of int
-    let inline h_add1 (Add1 x) = ef{return (x+1)}
-    let (a: unit->int) = fun () -> withHandler{
-        return! ef{let! x' = ef{yield Add1 9} in return x'}
-        yield h_add1
-    }
