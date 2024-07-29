@@ -204,7 +204,7 @@ type AddHandlerBuilder() =
     
     member inline __.ReturnFrom(code: EffectfulCode<_>) = code
     member inline __.Yield(handler: _ -> EffectfulCode<_>) = addHandler handler
-    member inline __.Run([<InlineIfLambda>]code: unit -> EffectfulCode<_>) = compile (code ())
+    member inline __.Run(code: unit -> EffectfulCode<_>) = compile (code ())
     member inline __.Run(code: EffectfulCode<_>) = compile code
     
     member inline __.Run(handlerAdder: EffectfulCode<_> -> EffectfulCode<_>) = handlerAdder
