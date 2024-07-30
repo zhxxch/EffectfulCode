@@ -17,7 +17,8 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>. *)
 
 module EffectfulCode
 
-//#nowarn "3513" // warning FS3513: 可恢复的代码调用。如果要根据现有可恢复代码定义新的低级别可恢复代码，请取消显示此警告。
+#nowarn "3513" // warning FS3513: 可恢复的代码调用。如果要根据现有可恢复代码定义新的低级别可恢复代码，请取消显示此警告。
+#nowarn "3514"
 
 open System.Runtime.CompilerServices
 open Microsoft.FSharp.Core
@@ -49,10 +50,10 @@ module DynamicCode =
                     if mf.Invoke(&sm) then
                         code2.Invoke(&sm)
                     else
-                        sm.ResumptionDynamicInfo.ResumptionFunc <- (resume (sm.ResumptionDynamicInfo.ResumptionFunc))
+                        sm.ResumptionDynamicInfo.ResumptionFunc <- resume sm.ResumptionDynamicInfo.ResumptionFunc
                         false)
 
-            sm.ResumptionDynamicInfo.ResumptionFunc <- (resume (sm.ResumptionDynamicInfo.ResumptionFunc))
+            sm.ResumptionDynamicInfo.ResumptionFunc <- resume sm.ResumptionDynamicInfo.ResumptionFunc
             false
 
     let inline bind (sm: byref<EffectfulCodeSM>, code: EffectfulCode<'codeT>, cont: 'codeT -> EffectfulCode<'contT>) =
@@ -81,6 +82,7 @@ module DynamicCode =
 
             false
         else
+            sm.Data.EffectType <- typeof<NoEffect>
             let raised = Unchecked.unbox<'e> sm.Data.Value
             let rf = sm.ResumptionDynamicInfo.ResumptionFunc
 
@@ -106,6 +108,7 @@ let inline addHandler (handler: 'e -> EffectfulCode<'resumeT>) (code: EffectfulC
             elif sm.Data.EffectType <> typeof<'e> then
                 true
             else
+                sm.Data.EffectType <- typeof<NoEffect>
                 let code_resume_point = sm.ResumptionPoint
                 let raised = Unchecked.unbox<'e> sm.Data.Value
                 let __stack_fin2 = (handler raised).Invoke(&sm)
@@ -137,7 +140,7 @@ let inline compile (code: EffectfulCode<'codeT>) =
 
         let resumptionInfo =
             { new EffectfulResumptionDynamicInfo(initialResumptionFunc) with
-                member info.MoveNext(sm) =
+                member info.MoveNext sm =
                     if info.ResumptionFunc.Invoke(&sm) then
                         sm.ResumptionPoint <- -1
 
@@ -160,10 +163,10 @@ type CodeBuilder() =
     member inline __.Return(x: 'T) =
         EffectfulCode<'T>(fun sm ->
             sm.Data.Value <- box x
-            sm.Data.EffectType <- typeof<NoEffect>
+            //sm.Data.EffectType <- typeof<NoEffect>
             true)
 
-    member inline self.Zero() = self.Return(())
+    member inline self.Zero() = self.Return ()
 
     member inline __.Yield(x: 'raiseT) =
         EffectfulCode<_>(fun sm ->
@@ -199,12 +202,11 @@ type AddHandlerBuilder() =
     member inline __.Combine(handlerAdder1, handlerAdder2) = handlerAdder1 >> handlerAdder2
 
     member inline __.Combine(code, handlerAdder) = handlerAdder code
-
-    member inline __.ReturnFrom(code: unit -> EffectfulCode<_>) = code ()
     
-    member inline __.ReturnFrom(code: EffectfulCode<_>) = code
+    member inline __.Combine(handlerAdder, code) = handlerAdder code
+
+    member inline __.Return(code: EffectfulCode<_>) = code
     member inline __.Yield(handler: _ -> EffectfulCode<_>) = addHandler handler
-    member inline __.Run(code: unit -> EffectfulCode<_>) = compile (code ())
     member inline __.Run(code: EffectfulCode<_>) = compile code
     
     member inline __.Run(handlerAdder: EffectfulCode<_> -> EffectfulCode<_>) = handlerAdder

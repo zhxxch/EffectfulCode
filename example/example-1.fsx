@@ -1,5 +1,4 @@
 #load "../src/EffectfulCode.fs"
-//#nowarn "3501"
 
 // declear computation expression (CE) builder
 let ef = new EffectfulCode.CodeBuilder()
@@ -72,33 +71,33 @@ let inline h_mul_tropical (Mul(x, y)) =
         return x + y
     }
 
-// add handlers(alternative way)
+// add handlers
 withHandler {
-    return! example1
+    return example1 ()
     yield h_input
     yield h_add
     yield h_mul
     yield h_log
 } |> fun f -> f () |> fun (a, a') -> printfn "(x + y) * z = %g (%g)" a a'
 
+// add handlers(alternative syntax & different handlers)
 let inline example1' () =
     example1 () |> withHandler{yield h_input}
 
-// add handlers(different handlers)
-let f = withHandler {
-    return! example1'
+let code = withHandler {
+    yield h_log
     yield h_add_tropical
     yield h_mul_tropical
-    yield h_log
+    return example1' ()
 }
 
-f () |> fun (a, a') -> printfn "(x + y) * z = %g (%g)" a a'
+code () |> fun (a, a') -> printfn "(x + y) * z = %g (%g)" a a'
 
 // trying to run effectful code with any unhandled effect raises an exception
 withHandler {
-    return! example1
+    return example1' ()
     yield h_input
     yield h_log
     yield h_add_tropical
     yield h_mul_tropical
-} |> fun f -> f () |> fun (a, a') -> printfn "(x + y) * z = %g (%g)" a a'
+} |> fun code -> code () |> fun (a, a') -> printfn "(x + y) * z = %g (%g)" a a'
