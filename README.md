@@ -1,10 +1,12 @@
 # Algebraic effects for F#
 
-This library (EffectfulCode.fs) implements **one-shot algebraic effects** in F# using [F# 6 Resumable Code](https://learn.microsoft.com/dotnet/fsharp/whats-new/fsharp-6#resumable-code), effectful codes are compiled to highly efficient state machines.
+This library (EffectfulCode.fs) implements **one-shot algebraic effects** in F# using [F# 6 Resumable Code](https://learn.microsoft.com/dotnet/fsharp/whats-new/fsharp-6#resumable-code); (when possible,) effectful codes are compiled to highly efficient state machines.
 
 How to using this library: see below demonstration.
 
-## Example 1
+## Examples
+
+### Example 1
 
 run `dotnet fsi -O example/example-1.fsx` to interact with this example program.
 
@@ -118,3 +120,11 @@ withHandler {
 ## Licence
 
 GPLv3
+
+## Annex 1 - about algebraic effects
+
+Readings:
+
+- Dan Abramov. [Algebraic Effects for the Rest of Us — overreacted](https://overreacted.io/algebraic-effects-for-the-rest-of-us/#a-function-has-no-color)
+- Nathanaël Courant. [Gagallium : Safely typing algebraic effects](https://gallium.inria.fr/blog/safely-typing-algebraic-effects/)
+- [A Neighborhood of Infinity: The Mother of all Monads](http://blog.sigfpe.com/2008/12/mother-of-all-monads.html)
